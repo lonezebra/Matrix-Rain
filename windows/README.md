@@ -77,3 +77,24 @@ fixed font.
 - To remove saved settings: delete the registry key
   `HKEY_CURRENT_USER\Software\MatrixRain` (e.g.
   `reg delete HKCU\Software\MatrixRain /f`).
+
+## Development
+
+`MatrixRain.scr /t` runs the display-independent simulation core
+(`rain.c`) headless for 300 frames and prints stream/dirty-cell
+statistics to a console — useful for CI or machines without a display.
+
+### CPU/GPU utilization regression test
+
+`tests\Measure-Utilization.ps1` launches `MatrixRain.scr /s` (the real
+fullscreen path) and samples process CPU% and GPU Engine utilization%
+via `Get-Counter` every 2s. It fails if late-run usage is more than 25%
+higher than early-run usage — the "chugs after a few seconds" pattern
+the glyph-atlas + dirty-cell `BitBlt` fix targets. GPU% reading `n/a` is
+expected on Windows versions/GPUs without GPU Engine performance
+counters (Windows 10 1803+ required); GDI text rendering here is
+CPU-side, so a low reading is correct, not a gap.
+
+```powershell
+.\tests\Measure-Utilization.ps1 -DurationSeconds 60
+```

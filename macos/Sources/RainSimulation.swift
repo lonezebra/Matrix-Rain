@@ -129,6 +129,62 @@ final class RainSimulation {
         }
     }
 
+    // MARK: - Display diffing
+
+    /// Packs a quantized shade level and glyph index into a single cell state
+    /// value: `(level << 16) | glyphIndex`. Level `levels` (one past the last
+    /// trail bucket) is the head. A dark cell is represented as -1, not packed.
+    static func packedState(level: Int, glyphIndex: Int) -> Int32 {
+        Int32((level << 16) | glyphIndex)
+    }
+
+    /// Diffs the current quantized display state against `state`, the
+    /// caller's last-drawn snapshot: rewrites `state` in place and appends the
+    /// flat index (`row * cols + col`) of every cell whose quantized shade
+    /// bucket or glyph changed to `dirtyCells`. Cells whose float brightness
+    /// moved without crossing a bucket boundary are NOT reported — that is
+    /// what makes per-frame invalidation cheap.
+    ///
+    /// `levels` is the number of trail buckets (the display's atlas depth);
+    /// quantization matches rendering: head cells get level `levels`, lit
+    /// trail cells get `min(levels - 1, Int(brightness * levels))`, dark
+    /// cells are -1.
+    ///
+    /// Indices are appended column by column with rows ascending, so callers
+    /// can coalesce contiguous vertical runs in one linear scan.
+    /// If `state` does not match the grid size it is reset to all-dark first
+    /// (every lit cell then reports dirty; callers treat that as a full
+    /// redraw). Lives here, not in the view, so it is testable without AppKit.
+    func syncDisplayState(levels: Int, state: inout [Int32], dirtyCells: inout [Int]) {
+        let count = cols * rows
+        if state.count != count {
+            state = Array(repeating: -1, count: count)
+        }
+        let flevels = Float(levels)
+        for c in 0..<cols {
+            let head = headRow(inColumn: c)
+            for r in 0..<rows {
+                let i = r * cols + c
+                let packed: Int32
+                if r == head {
+                    packed = Self.packedState(level: levels, glyphIndex: glyph[i])
+                } else {
+                    let b = brightness[i]
+                    if b <= 0 {
+                        packed = -1
+                    } else {
+                        let level = min(levels - 1, Int(b * flevels))
+                        packed = Self.packedState(level: level, glyphIndex: glyph[i])
+                    }
+                }
+                if state[i] != packed {
+                    state[i] = packed
+                    dirtyCells.append(i)
+                }
+            }
+        }
+    }
+
     private func spawnStream() {
         let idle = (0..<cols).filter { streams[$0] == nil }
         guard let c = idle.randomElement() else { return }

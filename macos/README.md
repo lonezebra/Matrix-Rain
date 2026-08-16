@@ -68,3 +68,21 @@ defaults -currentHost delete com.lonezebra.MatrixRain 2>/dev/null || true
 ```
 
 (Then pick a different saver in System Settings.)
+
+## Development
+
+### CPU/GPU utilization regression test
+
+`tests/measure_utilization.sh` runs `MatrixRain.saver` inside the
+legacy `ScreenSaverEngine` preview harness and samples CPU/GPU active
+residency via `powermetrics` (requires `sudo`) every 2s. It fails if
+late-run CPU% is more than 25% higher than early-run CPU% — the "chugs
+after a few seconds" pattern the dirty-rect invalidation fix targets.
+
+```sh
+./tests/measure_utilization.sh 60   # duration in seconds
+```
+
+`powermetrics` field names have shifted across macOS releases; if the
+script reports "too few samples parsed", check the raw output path it
+prints and adjust the `grep` patterns for your OS version.

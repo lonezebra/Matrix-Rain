@@ -20,7 +20,6 @@
 #include <X11/Xlib.h>
 #include <X11/Xutil.h>
 #include <X11/keysym.h>
-#include <X11/extensions/Xdbe.h>
 #include <X11/Xft/Xft.h>
 
 #include "rain.h"
@@ -28,6 +27,7 @@
 #define CELL_W_FACTOR 0.62f
 #define CELL_H_FACTOR 1.05f
 #define SHADES 24               /* quantized trail brightness levels */
+#define HEAD_LEVEL (SHADES + 1) /* pseudo shade level for the head color */
 #define MAX_GLYPHS 80
 
 /* ---------------------------------------------------------------- settings */
@@ -350,34 +350,37 @@ static void on_signal(int sig)
     quit_flag = 1;
 }
 
-static int xdbe_error;
-static int (*prev_error_handler)(Display *, XErrorEvent *);
-
-static int trap_xdbe_error(Display *dpy, XErrorEvent *ev)
-{
-    (void)dpy;
-    (void)ev;
-    xdbe_error = 1;
-    return 0;
-}
-
 typedef struct {
     Display *dpy;
     int screen;
     Window win;
     int width, height;
     int own_window;             /* we created it (fullscreen or -window) */
-    int use_dbe;
-    XdbeBackBuffer back;
-    Pixmap pix;                 /* fallback back buffer */
-    GC gc;
+    Pixmap pix;                 /* persistent back buffer */
+    GC gc;                      /* black-foreground GC for fills and blits */
     XftDraw *draw;
     XftFont *font;
-    XftColor black, head;
+    XftColor head;
     XftColor trail[SHADES + 1];
     int cell_w, cell_h, baseline;
-    short glyph_xoff[MAX_GLYPHS]; /* centering offset per glyph */
+    short glyph_xoff[MAX_GLYPHS];  /* centering offset per glyph */
+    FT_UInt glyph_idx[MAX_GLYPHS]; /* FT glyph index per glyph (XftCharIndex) */
+
+    /* Dirty-cell state: what the back buffer currently shows per cell.
+     * last_lvl is -1 for empty, 1..SHADES for trail shades, HEAD_LEVEL for
+     * the head color; last_gly is the glyph table index drawn there. */
+    int    cells;               /* cols * rows the arrays are sized for */
+    short          *last_lvl;
+    unsigned short *last_gly;
+    /* Per-frame scratch (sized to cells). */
+    XftGlyphFontSpec *specs;    /* dirty glyphs in scan order */
+    short            *spec_lvl; /* shade level per entry in specs */
+    XftGlyphFontSpec *sorted;   /* specs grouped by shade level */
+    XRectangle       *rects;    /* cell rects to clear to black */
 } Gfx;
+
+static long bench_glyph_calls;  /* XftDrawGlyphFontSpec calls this frame */
+static long bench_dirty_cells;  /* cells repainted this frame */
 
 static double now_sec(void)
 {
@@ -391,10 +394,6 @@ static void alloc_colors(Gfx *g, const Settings *st)
     Visual *vis = DefaultVisual(g->dpy, g->screen);
     Colormap cmap = DefaultColormap(g->dpy, g->screen);
     XRenderColor rc;
-
-    rc.red = rc.green = rc.blue = 0;
-    rc.alpha = 0xFFFF;
-    XftColorAllocValue(g->dpy, vis, cmap, &rc, &g->black);
 
     for (int i = 0; i <= SHADES; i++) {
         float t = (float)i / SHADES;
@@ -425,6 +424,7 @@ static void compute_metrics(Gfx *g, const Settings *st)
         XGlyphInfo gi;
         XftTextExtents32(g->dpy, g->font, &glyphs[i], 1, &gi);
         g->glyph_xoff[i] = (short)((g->cell_w - gi.xOff) / 2);
+        g->glyph_idx[i] = XftCharIndex(g->dpy, g->font, glyphs[i]);
     }
 }
 
@@ -439,80 +439,203 @@ static Cursor make_blank_cursor(Display *dpy, Window win)
     return cur;
 }
 
-/* Set up the drawing target: Xdbe back buffer if available, else a Pixmap. */
+/* (Re)allocate the per-cell dirty-tracking state and per-frame scratch
+ * arrays, and mark every cell as "unknown" so the next frame repaints all
+ * visible cells. Exits on OOM (a few bytes per screen cell). */
+static void reset_cell_state(Gfx *g, int cols, int rows)
+{
+    int n = cols * rows;
+    if (n != g->cells) {
+        free(g->last_lvl);
+        free(g->last_gly);
+        free(g->specs);
+        free(g->spec_lvl);
+        free(g->sorted);
+        free(g->rects);
+        g->last_lvl = malloc((size_t)n * sizeof *g->last_lvl);
+        g->last_gly = malloc((size_t)n * sizeof *g->last_gly);
+        g->specs    = malloc((size_t)n * sizeof *g->specs);
+        g->spec_lvl = malloc((size_t)n * sizeof *g->spec_lvl);
+        g->sorted   = malloc((size_t)n * sizeof *g->sorted);
+        g->rects    = malloc((size_t)n * sizeof *g->rects);
+        if (!g->last_lvl || !g->last_gly || !g->specs || !g->spec_lvl ||
+            !g->sorted || !g->rects) {
+            fprintf(stderr, "matrix-rain: out of memory\n");
+            exit(1);
+        }
+        g->cells = n;
+    }
+    for (int i = 0; i < n; i++) {
+        g->last_lvl[i] = -1;
+        g->last_gly[i] = 0;
+    }
+}
+
+static void free_cell_state(Gfx *g)
+{
+    free(g->last_lvl);
+    free(g->last_gly);
+    free(g->specs);
+    free(g->spec_lvl);
+    free(g->sorted);
+    free(g->rects);
+}
+
+/* Create the persistent back-buffer Pixmap and clear it to black. */
 static void setup_backbuffer(Gfx *g)
 {
-    int major, minor;
-    g->use_dbe = 0;
-    if (XdbeQueryExtension(g->dpy, &major, &minor)) {
-        xdbe_error = 0;
-        prev_error_handler = XSetErrorHandler(trap_xdbe_error);
-        g->back = XdbeAllocateBackBufferName(g->dpy, g->win, XdbeUndefined);
-        XSync(g->dpy, False);
-        XSetErrorHandler(prev_error_handler);
-        if (!xdbe_error && g->back != None)
-            g->use_dbe = 1;
-    }
-    if (!g->use_dbe) {
-        g->pix = XCreatePixmap(g->dpy, g->win, (unsigned)g->width,
-                               (unsigned)g->height,
-                               (unsigned)DefaultDepth(g->dpy, g->screen));
-        g->gc = XCreateGC(g->dpy, g->win, 0, NULL);
-    }
-
-    Drawable target = g->use_dbe ? (Drawable)g->back : (Drawable)g->pix;
-    g->draw = XftDrawCreate(g->dpy, target,
+    g->pix = XCreatePixmap(g->dpy, g->win, (unsigned)g->width,
+                           (unsigned)g->height,
+                           (unsigned)DefaultDepth(g->dpy, g->screen));
+    XGCValues gv;
+    gv.foreground = BlackPixel(g->dpy, g->screen);
+    gv.graphics_exposures = False;
+    g->gc = XCreateGC(g->dpy, g->win, GCForeground | GCGraphicsExposures, &gv);
+    XFillRectangle(g->dpy, g->pix, g->gc, 0, 0,
+                   (unsigned)g->width, (unsigned)g->height);
+    g->draw = XftDrawCreate(g->dpy, g->pix,
                             DefaultVisual(g->dpy, g->screen),
                             DefaultColormap(g->dpy, g->screen));
 }
 
 static void resize_backbuffer(Gfx *g)
 {
-    if (g->use_dbe)
-        return;                 /* Xdbe back buffers track the window size */
     XFreePixmap(g->dpy, g->pix);
     g->pix = XCreatePixmap(g->dpy, g->win, (unsigned)g->width,
                            (unsigned)g->height,
                            (unsigned)DefaultDepth(g->dpy, g->screen));
+    XFillRectangle(g->dpy, g->pix, g->gc, 0, 0,
+                   (unsigned)g->width, (unsigned)g->height);
     XftDrawChange(g->draw, g->pix);
 }
 
+/* Quantized shade level for a cell: -1 empty, 1..SHADES trail, HEAD_LEVEL
+ * head. Levels that would render pure black count as empty. */
+static inline int cell_level(float b, int is_head)
+{
+    if (is_head)
+        return HEAD_LEVEL;
+    if (b < 0.02f)
+        return -1;
+    int lvl = (int)(b * SHADES + 0.5f);
+    if (lvl > SHADES)
+        lvl = SHADES;
+    return lvl >= 1 ? lvl : -1;
+}
+
+/* Dirty-cell render onto the persistent Pixmap:
+ *  1. diff each cell's quantized shade level + glyph against what the back
+ *     buffer already shows; unchanged cells are skipped entirely,
+ *  2. clear the changed cells' rects to black (one batched fill request),
+ *  3. repaint changed visible cells with ONE XftDrawGlyphFontSpec call per
+ *     non-empty color bucket (head + each trail shade, <= SHADES+1 calls),
+ *  4. blit the full frame to the window (one cheap atomic copy). */
 static void render(Gfx *g, const Rain *r)
 {
-    XftDrawRect(g->draw, &g->black, 0, 0, (unsigned)g->width, (unsigned)g->height);
+    int ndirty = 0, nrect = 0;
 
     for (int c = 0; c < r->cols; c++) {
         const float *bright = r->cell_bright + (size_t)c * (size_t)r->rows;
         const unsigned short *gly = r->cell_glyph + (size_t)c * (size_t)r->rows;
+        short *last_lvl = g->last_lvl + c * r->rows;
+        unsigned short *last_gly = g->last_gly + c * r->rows;
         int head = rain_head_cell(r, c);
         int x = c * g->cell_w;
         for (int y = 0; y < r->rows; y++) {
-            XftColor *color;
-            if (y == head) {
-                color = &g->head;
-            } else {
-                float b = bright[y];
-                if (b < 0.02f)
-                    continue;
-                int lvl = (int)(b * SHADES + 0.5f);
-                if (lvl > SHADES)
-                    lvl = SHADES;
-                color = &g->trail[lvl];
+            int lvl = cell_level(bright[y], y == head);
+            unsigned short gi = gly[y];
+            if (lvl == last_lvl[y] && (lvl < 0 || gi == last_gly[y]))
+                continue;       /* back buffer already shows this cell */
+            if (last_lvl[y] >= 0) {         /* erase what was there */
+                g->rects[nrect].x = (short)x;
+                g->rects[nrect].y = (short)(y * g->cell_h);
+                g->rects[nrect].width = (unsigned short)g->cell_w;
+                g->rects[nrect].height = (unsigned short)g->cell_h;
+                nrect++;
             }
-            int gi = gly[y];
-            XftDrawString32(g->draw, color, g->font,
-                            x + g->glyph_xoff[gi], y * g->cell_h + g->baseline,
-                            &glyphs[gi], 1);
+            if (lvl >= 1) {                 /* draw the new glyph */
+                g->specs[ndirty].font = g->font;
+                g->specs[ndirty].x = (short)(x + g->glyph_xoff[gi]);
+                g->specs[ndirty].y = (short)(y * g->cell_h + g->baseline);
+                g->specs[ndirty].glyph = g->glyph_idx[gi];
+                g->spec_lvl[ndirty] = (short)lvl;
+                ndirty++;
+            }
+            last_lvl[y] = (short)lvl;
+            last_gly[y] = gi;
         }
     }
 
-    if (g->use_dbe) {
-        XdbeSwapInfo si = { g->win, XdbeUndefined };
-        XdbeSwapBuffers(g->dpy, &si, 1);
-    } else {
-        XCopyArea(g->dpy, g->pix, g->win, g->gc, 0, 0,
-                  (unsigned)g->width, (unsigned)g->height, 0, 0);
+    /* Batched black fill of every changed cell (chunked to stay well under
+     * the X protocol's maximum request size). */
+    for (int i = 0; i < nrect; i += 4096) {
+        int chunk = nrect - i > 4096 ? 4096 : nrect - i;
+        XFillRectangles(g->dpy, g->pix, g->gc, g->rects + i, chunk);
     }
+
+    /* Group dirty glyphs by shade level (counting sort), then draw each
+     * bucket with batched XftDrawGlyphFontSpec calls.
+     *
+     * Batches must stay spatially compact: Xft renders glyph specs through
+     * XRender CompositeGlyphs with a mask format, and the server rasterizes
+     * that via a scratch mask covering the union bounding box of all glyphs
+     * in the call. A single call whose glyphs are scattered across the
+     * screen therefore costs a full-screen composite (catastrophic on
+     * software servers). Specs are emitted in column-major scan order, so
+     * spatial neighbors are adjacent in each bucket; greedily merge a glyph
+     * into the current chunk only while the chunk's bounding box grows a
+     * little, and flush otherwise. Clusters (same-column runs, adjacent
+     * columns) share one call; isolated cells get their own tiny call. */
+    int count[HEAD_LEVEL + 1];
+    memset(count, 0, sizeof count);
+    for (int i = 0; i < ndirty; i++)
+        count[g->spec_lvl[i]]++;
+    int offset[HEAD_LEVEL + 1];
+    int acc = 0;
+    for (int l = 1; l <= HEAD_LEVEL; l++) {
+        offset[l] = acc;
+        acc += count[l];
+    }
+    int fill[HEAD_LEVEL + 1];
+    memcpy(fill, offset, sizeof fill);
+    for (int i = 0; i < ndirty; i++)
+        g->sorted[fill[g->spec_lvl[i]]++] = g->specs[i];
+
+    long cell_area = (long)g->cell_w * g->cell_h;
+    long merge_area = 10 * cell_area;   /* max bbox growth per merged glyph */
+    long max_area = 160 * cell_area;    /* absolute chunk bbox cap */
+    for (int l = 1; l <= HEAD_LEVEL; l++) {
+        if (count[l] == 0)
+            continue;
+        XftColor *color = (l == HEAD_LEVEL) ? &g->head : &g->trail[l];
+        const XftGlyphFontSpec *sp = g->sorted + offset[l];
+        int nsp = count[l];
+        int start = 0;
+        int x1 = sp[0].x, x2 = sp[0].x, y1 = sp[0].y, y2 = sp[0].y;
+        for (int k = 1; k < nsp; k++) {
+            int nx1 = sp[k].x < x1 ? sp[k].x : x1;
+            int nx2 = sp[k].x > x2 ? sp[k].x : x2;
+            int ny1 = sp[k].y < y1 ? sp[k].y : y1;
+            int ny2 = sp[k].y > y2 ? sp[k].y : y2;
+            long old_area = (long)(x2 - x1 + g->cell_w) * (y2 - y1 + g->cell_h);
+            long new_area = (long)(nx2 - nx1 + g->cell_w) * (ny2 - ny1 + g->cell_h);
+            if (new_area - old_area > merge_area || new_area > max_area) {
+                XftDrawGlyphFontSpec(g->draw, color, sp + start, k - start);
+                bench_glyph_calls++;
+                start = k;
+                x1 = x2 = sp[k].x;
+                y1 = y2 = sp[k].y;
+            } else {
+                x1 = nx1; x2 = nx2; y1 = ny1; y2 = ny2;
+            }
+        }
+        XftDrawGlyphFontSpec(g->draw, color, sp + start, nsp - start);
+        bench_glyph_calls++;
+    }
+    bench_dirty_cells += ndirty + nrect;
+
+    XCopyArea(g->dpy, g->pix, g->win, g->gc, 0, 0,
+              (unsigned)g->width, (unsigned)g->height, 0, 0);
     XFlush(g->dpy);
 }
 
@@ -532,6 +655,7 @@ int main(int argc, char **argv)
     RunMode mode = MODE_FULLSCREEN;
     Window target_win = None;
     int want_selftest = 0;
+    int bench_seconds = 0;      /* hidden: -bench <seconds> */
 
     load_config(&st);
 
@@ -559,6 +683,10 @@ int main(int argc, char **argv)
             mode = MODE_WINDOW_ID;
         } else if (!strcmp(a, "-selftest")) {
             want_selftest = 1;
+        } else if (!strcmp(a, "-bench")) {
+            if (++i >= argc) goto missing_arg;
+            bench_seconds = atoi(argv[i]);
+            if (bench_seconds < 1) bench_seconds = 1;
         } else if (!strcmp(a, "-color") || !strcmp(a, "-density") ||
                    !strcmp(a, "-size") || !strcmp(a, "-speed") ||
                    !strcmp(a, "-fps") || !strcmp(a, "-font")) {
@@ -627,6 +755,10 @@ int main(int argc, char **argv)
     case MODE_WINDOW: {
         g.width = 1024;
         g.height = 768;
+        if (bench_seconds > 0) {        /* bench at full display resolution */
+            g.width = DisplayWidth(g.dpy, g.screen);
+            g.height = DisplayHeight(g.dpy, g.screen);
+        }
         XSetWindowAttributes attrs;
         attrs.background_pixel = BlackPixel(g.dpy, g.screen);
         attrs.event_mask = KeyPressMask | ButtonPressMask | ExposureMask |
@@ -667,11 +799,71 @@ int main(int argc, char **argv)
     int rows = g.height / g.cell_h;
     if (cols < 1) cols = 1;
     if (rows < 1) rows = 1;
+    reset_cell_state(&g, cols, rows);
     Rain *rain = rain_create(cols, rows, st.density, st.speed, glyph_count,
                              (unsigned)time(NULL) ^ (unsigned)getpid());
     if (!rain) {
         fprintf(stderr, "matrix-rain: out of memory\n");
         return 1;
+    }
+
+    if (bench_seconds > 0) {
+        /* Warm up: ~60 simulated seconds so the grid reaches the filled
+         * steady state before timing starts. */
+        for (int i = 0; i < 1200; i++)
+            rain_step(rain, 0.05f);
+        /* Uncapped render loop: advance the simulation with real dt, render
+         * each frame, measure. XSync makes the server finish each frame so
+         * the timing includes server-side raster work. */
+        XSync(g.dpy, False);
+        double start = now_sec(), last_b = start;
+        long frames = 0, total_calls = 0, total_dirty = 0;
+        double total_ms = 0.0, max_ms = 0.0;
+        while (now_sec() - start < (double)bench_seconds && !quit_flag) {
+            while (XPending(g.dpy)) {
+                XEvent ev;
+                XNextEvent(g.dpy, &ev);
+            }
+            double t = now_sec();
+            float dt = (float)(t - last_b);
+            if (dt > 0.1f)
+                dt = 0.1f;
+            last_b = t;
+            rain_step(rain, dt);
+            bench_glyph_calls = 0;
+            bench_dirty_cells = 0;
+            double r0 = now_sec();
+            render(&g, rain);
+            XSync(g.dpy, False);
+            double ms = (now_sec() - r0) * 1000.0;
+            total_ms += ms;
+            if (ms > max_ms)
+                max_ms = ms;
+            total_calls += bench_glyph_calls;
+            total_dirty += bench_dirty_cells;
+            frames++;
+        }
+        double elapsed = now_sec() - start;
+        printf("bench: %dx%d cells=%dx%d  %.1fs\n",
+               g.width, g.height, cols, rows, elapsed);
+        printf("bench: frames=%ld  fps=%.1f\n",
+               frames, (double)frames / elapsed);
+        printf("bench: render avg=%.3f ms  max=%.3f ms\n",
+               frames ? total_ms / (double)frames : 0.0, max_ms);
+        printf("bench: glyph-draw-calls avg=%.1f per frame\n",
+               frames ? (double)total_calls / (double)frames : 0.0);
+        printf("bench: dirty-cell ops avg=%.1f per frame\n",
+               frames ? (double)total_dirty / (double)frames : 0.0);
+        rain_destroy(rain);
+        free_cell_state(&g);
+        XftDrawDestroy(g.draw);
+        XftFontClose(g.dpy, g.font);
+        XFreePixmap(g.dpy, g.pix);
+        XFreeGC(g.dpy, g.gc);
+        if (g.own_window)
+            XDestroyWindow(g.dpy, g.win);
+        XCloseDisplay(g.dpy);
+        return 0;
     }
 
     const double frame = 1.0 / st.fps;
@@ -713,11 +905,17 @@ int main(int argc, char **argv)
                     rows = g.height / g.cell_h;
                     if (cols < 1) cols = 1;
                     if (rows < 1) rows = 1;
+                    reset_cell_state(&g, cols, rows); /* full repaint next frame */
                     if (rain_resize(rain, cols, rows) != 0) {
                         fprintf(stderr, "matrix-rain: out of memory\n");
                         running = 0;
                     }
                 }
+                break;
+            case Expose:
+                if (ev.xexpose.count == 0)  /* repaint from persistent buffer */
+                    XCopyArea(g.dpy, g.pix, g.win, g.gc, 0, 0,
+                              (unsigned)g.width, (unsigned)g.height, 0, 0);
                 break;
             default:
                 break;
@@ -757,12 +955,11 @@ int main(int argc, char **argv)
         XUngrabKeyboard(g.dpy, CurrentTime);
         XUngrabPointer(g.dpy, CurrentTime);
     }
+    free_cell_state(&g);
     XftDrawDestroy(g.draw);
     XftFontClose(g.dpy, g.font);
-    if (!g.use_dbe) {
-        XFreePixmap(g.dpy, g.pix);
-        XFreeGC(g.dpy, g.gc);
-    }
+    XFreePixmap(g.dpy, g.pix);
+    XFreeGC(g.dpy, g.gc);
     if (g.own_window)
         XDestroyWindow(g.dpy, g.win);
     XCloseDisplay(g.dpy);
