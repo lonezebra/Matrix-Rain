@@ -1,4 +1,5 @@
 import AppKit
+import Foundation
 import ScreenSaver
 import QuartzCore
 
@@ -18,6 +19,15 @@ final class MatrixRainView: ScreenSaverView {
     private var lastFrameTime: CFTimeInterval = 0
     private var sheetController: ConfigureSheetController?
 
+    /// MATRIX_RAIN_FPSLOG=1 prints achieved fps every ~2s from the real,
+    /// animationTimeInterval-driven loop -- the Swift counterpart of Linux's
+    /// -fpslog flag, so an external monitor can correlate CPU/GPU% samples
+    /// with actual frame delivery. Silent (and free) unless the env var is
+    /// set; a screensaver bundle has no argv of its own to gate a CLI flag.
+    private static let fpsLogEnabled = ProcessInfo.processInfo.environment["MATRIX_RAIN_FPSLOG"] == "1"
+    private var fpsLogWindowStart: CFTimeInterval = 0
+    private var fpsLogFrameCount = 0
+
     /// Last-drawn quantized state per cell (see RainSimulation.packedState;
     /// -1 = dark). Emptied to force a resync + full repaint.
     private var cellState: [Int32] = []
@@ -28,7 +38,11 @@ final class MatrixRainView: ScreenSaverView {
     /// per-cell rects (first frame, resize, settings/backing change).
     private var needsFullRedraw = true
 
-    override init?(frame: NSRect, isPreview: Bool) {
+    // `required` so PreviewHost.swift (tests/) can dynamically construct the
+    // bundle's principal class through a `ScreenSaverView.Type` value -- has
+    // no effect on how System Settings/ScreenSaverEngine load this bundle,
+    // since those use plain Objective-C dynamic dispatch.
+    required override init?(frame: NSRect, isPreview: Bool) {
         super.init(frame: frame, isPreview: isPreview)
         commonInit()
     }
@@ -75,6 +89,19 @@ final class MatrixRainView: ScreenSaverView {
             setNeedsDisplay(bounds)
         } else {
             invalidateDirtyRuns()
+        }
+
+        if Self.fpsLogEnabled {
+            if fpsLogWindowStart == 0 { fpsLogWindowStart = now }
+            fpsLogFrameCount += 1
+            let elapsed = now - fpsLogWindowStart
+            if elapsed >= 2.0 {
+                let fps = Double(fpsLogFrameCount) / elapsed
+                print(String(format: "fpslog t=%.1f fps=%.2f frames=%d", now, fps, fpsLogFrameCount))
+                fflush(stdout)
+                fpsLogWindowStart = now
+                fpsLogFrameCount = 0
+            }
         }
     }
 
