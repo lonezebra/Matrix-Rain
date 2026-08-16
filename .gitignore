@@ -1,0 +1,14 @@
+# build outputs
+linux/matrix-rain
+windows/MatrixRain.scr
+windows/*.obj
+windows/*.o
+linux/*.o
+macos/MatrixRain.saver/
+macos/*.o
+macos/*.swiftmodule
+macos/*.swiftdoc
+
+# editor/os noise
+.DS_Store
+*.swp
