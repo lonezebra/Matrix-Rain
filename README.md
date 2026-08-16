@@ -41,7 +41,7 @@ cd windows && make
 # then right-click MatrixRain.scr → Install
 ```
 
-**Linux** (Debian/Ubuntu deps: libx11-dev libxft-dev libxext-dev):
+**Linux** (Debian/Ubuntu deps: libx11-dev libxft-dev libfontconfig-dev):
 ```sh
 cd linux && make && sudo make install
 matrix-rain            # fullscreen, any key exits
@@ -53,11 +53,26 @@ Settings live where each OS expects them: `ScreenSaverDefaults` on macOS
 dialog UI), and `~/.config/matrix-rain/matrix-rain.conf` + CLI flags on
 Linux.
 
+## Performance
+
+All three renderers use **dirty-cell rendering**: a cell is only
+repainted when its brightness crosses into a new shade level or its
+glyph changes, instead of redrawing the whole grid every frame. Each
+platform has a `tests/measure_utilization.sh` (PowerShell on Windows)
+script that runs the real render loop and fails if CPU usage grows as
+the screen fills — see each platform's README "Development" section.
+GPU acceleration was evaluated but skipped: the CPU fix already gets
+4K frame times under 3ms, so a GPU rewrite wasn't worth the added
+per-platform complexity (Metal / Direct2D-Direct3D / OpenGL).
+
 ## Repo layout
 
 ```
 SPEC.md      shared visual/simulation/settings specification
 macos/       Swift .saver bundle + Makefile (no Xcode project needed)
+             tests/measure_utilization.sh — CPU/GPU utilization regression test
 windows/     Win32 C .scr + Makefile (MinGW) + build.bat (MSVC)
+             tests/Measure-Utilization.ps1 — CPU/GPU utilization regression test
 linux/       Xlib/Xft C source + Makefile + xscreensaver integration
+             tests/measure_utilization.sh — CPU/GPU utilization regression test
 ```

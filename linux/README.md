@@ -115,3 +115,19 @@ for regression-checking render performance, e.g.:
 ```sh
 xvfb-run -s "-screen 0 1920x1080x24" ./matrix-rain -window -bench 20
 ```
+
+### CPU/GPU utilization regression test
+
+`tests/measure_utilization.sh` runs the real fps-capped renderer for a
+while and samples process CPU% (from `/proc/<pid>/stat`) every 2s, plus
+GPU% if `nvidia-smi`/`intel_gpu_top`/`radeontop` is installed. It fails
+if late-run CPU% is more than 25% higher than early-run CPU% — that
+growth pattern is exactly the "chugs after a few seconds" symptom the
+dirty-cell rendering fix targets. GPU% reading `n/a` or ~0% is expected
+and not a failure (Xft/XRender rendering here is CPU-side).
+
+```sh
+./tests/measure_utilization.sh 60 1920 1080   # duration, width, height
+```
+
+Uses Xvfb automatically if `$DISPLAY` isn't already set.
