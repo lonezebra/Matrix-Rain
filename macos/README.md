@@ -71,18 +71,36 @@ defaults -currentHost delete com.lonezebra.MatrixRain 2>/dev/null || true
 
 ## Development
 
-### CPU/GPU utilization regression test
+### CPU/GPU/framerate regression test
 
-`tests/measure_utilization.sh` runs `MatrixRain.saver` inside the
-legacy `ScreenSaverEngine` preview harness and samples CPU/GPU active
-residency via `powermetrics` (requires `sudo`) every 2s. It fails if
-late-run CPU% is more than 25% higher than early-run CPU% — the "chugs
-after a few seconds" pattern the dirty-rect invalidation fix targets.
+`tests/measure_utilization.sh` runs the built `MatrixRain.saver` (from
+`make` — no need to `make install` first) inside `tests/PreviewHost.swift`,
+a small standalone AppKit host built on first use. That replaces an
+earlier version of this script that shelled out to the legacy
+`ScreenSaverEngine` binary — that binary has moved or disappeared on
+recent macOS releases (screensaver hosting moved into a System Settings
+extension), so PreviewHost loads the bundle directly instead, which only
+depends on the public `ScreenSaverView` contract.
+
+It samples every 2s for the given duration:
+- **CPU%** via `ps` — no privileges needed.
+- **fps** — `MatrixRainView` prints its real achieved framerate when
+  `MATRIX_RAIN_FPSLOG=1` is set (which the script sets), independent of
+  the animation timer's 30 fps target.
+- **GPU active residency** via `powermetrics`, system-wide — this
+  *does* need `sudo`; if you decline the prompt, the script still runs
+  and reports GPU as unavailable, since CPU%/fps are the primary
+  regression signal.
+
+It fails if late-run CPU% is more than 25% higher than early-run CPU%
+— the "chugs after a few seconds" pattern the dirty-rect invalidation
+fix targets.
 
 ```sh
 ./tests/measure_utilization.sh 60   # duration in seconds
 ```
 
-`powermetrics` field names have shifted across macOS releases; if the
-script reports "too few samples parsed", check the raw output path it
-prints and adjust the `grep` patterns for your OS version.
+If `PreviewHost` fails to build, you likely need
+`xcode-select --install` (see Requirements above). If it builds but the
+bundle fails to load, re-run `codesign --force --sign - MatrixRain.saver`
+(ad-hoc signing can be invalidated by editing files after `make`).
