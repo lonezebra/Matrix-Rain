@@ -73,14 +73,16 @@ defaults -currentHost delete com.lonezebra.MatrixRain 2>/dev/null || true
 
 ### CPU/GPU/framerate regression test
 
-`tests/measure_utilization.sh` runs the built `MatrixRain.saver` (from
-`make` — no need to `make install` first) inside `tests/PreviewHost.swift`,
-a small standalone AppKit host built on first use. That replaces an
-earlier version of this script that shelled out to the legacy
-`ScreenSaverEngine` binary — that binary has moved or disappeared on
-recent macOS releases (screensaver hosting moved into a System Settings
-extension), so PreviewHost loads the bundle directly instead, which only
-depends on the public `ScreenSaverView` contract.
+`tests/measure_utilization.sh` runs `make` for you first (so it always
+measures the bundle matching your current source, never a stale build
+left over from earlier — no need to run it separately, and no need for
+`make install`), then runs `MatrixRain.saver` inside
+`tests/PreviewHost.swift`, a small standalone AppKit host built on first
+use. That replaces an earlier version of this script that shelled out to
+the legacy `ScreenSaverEngine` binary — that binary has moved or
+disappeared on recent macOS releases (screensaver hosting moved into a
+System Settings extension), so PreviewHost loads the bundle directly
+instead, which only depends on the public `ScreenSaverView` contract.
 
 It samples every 2s for the given duration:
 - **CPU%** via `ps` — no privileges needed.
