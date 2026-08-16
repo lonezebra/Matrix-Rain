@@ -1,0 +1,22 @@
+Add matrix-rain to XScreenSaver:
+
+1. Make sure the binary is on xscreensaver's PATH (e.g. `make install` puts
+   it in /usr/local/bin).
+
+2. Add this line to the `programs:` list in ~/.xscreensaver (each entry ends
+   with a backslash-newline continuation, matching the surrounding entries):
+
+                  "Matrix Rain"  matrix-rain -root                          \n\
+
+   Settings can be added on the same line, e.g.:
+
+                  "Matrix Rain"  matrix-rain -root -color amber -density 0.9 \n\
+
+3. Restart the daemon so it rereads the file:
+
+   xscreensaver-command -restart
+
+xscreensaver runs hacks with the XSCREENSAVER_WINDOW environment variable
+pointing at the window to draw on; matrix-rain honors it automatically, so
+`-root` simply works both on the real root window and under the daemon or
+in the xscreensaver-settings preview.

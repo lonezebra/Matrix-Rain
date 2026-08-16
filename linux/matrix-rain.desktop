@@ -1,0 +1,9 @@
+[Desktop Entry]
+Type=Application
+Name=Matrix Rain
+GenericName=Screensaver
+Comment=Matrix digital rain screensaver (fullscreen, press any key to exit)
+Exec=matrix-rain
+Terminal=false
+Categories=Utility;Amusement;
+Keywords=matrix;rain;screensaver;digital;
