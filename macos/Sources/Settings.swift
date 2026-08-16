@@ -2,10 +2,10 @@ import AppKit
 import ScreenSaver
 
 /// Typed access to the shared settings (SPEC.md section 2), persisted with
-/// ScreenSaverDefaults under the module "com.lonezebra.MatrixRain".
+/// ScreenSaverDefaults under the module "com.sharpenedbanana.MatrixRain".
 struct Settings {
 
-    static let moduleName = "com.lonezebra.MatrixRain"
+    static let moduleName = "com.sharpenedbanana.MatrixRain"
     static let defaultColorHex = "#00FF41"
 
     enum Keys {

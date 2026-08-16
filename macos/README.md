@@ -58,13 +58,13 @@ Open **System Settings → Screen Saver**, select Matrix Rain, and click
 - **Speed** — 0.5x–3.0x, default 1.0x
 
 Settings persist via `ScreenSaverDefaults` under
-`com.lonezebra.MatrixRain` and take effect immediately on OK.
+`com.sharpenedbanana.MatrixRain` and take effect immediately on OK.
 
 ## Uninstall
 
 ```sh
 rm -rf ~/Library/Screen\ Savers/MatrixRain.saver
-defaults -currentHost delete com.lonezebra.MatrixRain 2>/dev/null || true
+defaults -currentHost delete com.sharpenedbanana.MatrixRain 2>/dev/null || true
 ```
 
 (Then pick a different saver in System Settings.)
