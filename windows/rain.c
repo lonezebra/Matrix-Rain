@@ -48,9 +48,15 @@ static float frange(unsigned *s, float a, float b)
     return a + (b - a) * frand(s);
 }
 
-static wchar_t random_glyph(unsigned *s)
+static int random_glyph_index(unsigned *s)
 {
-    return g_glyphs[xr(s) % (unsigned)g_glyphCount];
+    return (int)(xr(s) % (unsigned)g_glyphCount);
+}
+
+static void set_cell_glyph(RainSim *s, size_t cell, int gi)
+{
+    s->glyph[cell]    = g_glyphs[gi];
+    s->glyphIdx[cell] = (unsigned char)gi;
 }
 
 static int ifloor(float x)
@@ -89,12 +95,14 @@ int rain_init(RainSim *s, int cols, int rows, float density, float speedMul,
     s->speedMul = speedMul;
     s->rng      = seed ? seed : 0x9E3779B9u;
 
-    s->glyph   = calloc((size_t)cols * rows, sizeof(wchar_t));
-    s->bright  = calloc((size_t)cols * rows, sizeof(float));
-    s->streams = calloc((size_t)cols, sizeof(RainStream));
-    s->decay   = calloc((size_t)cols, sizeof(float));
-    s->idle    = calloc((size_t)cols, sizeof(int));
-    if (!s->glyph || !s->bright || !s->streams || !s->decay || !s->idle) {
+    s->glyph    = calloc((size_t)cols * rows, sizeof(wchar_t));
+    s->glyphIdx = calloc((size_t)cols * rows, sizeof(unsigned char));
+    s->bright   = calloc((size_t)cols * rows, sizeof(float));
+    s->streams  = calloc((size_t)cols, sizeof(RainStream));
+    s->decay    = calloc((size_t)cols, sizeof(float));
+    s->idle     = calloc((size_t)cols, sizeof(int));
+    if (!s->glyph || !s->glyphIdx || !s->bright || !s->streams || !s->decay
+            || !s->idle) {
         rain_free(s);
         return -1;
     }
@@ -115,6 +123,7 @@ int rain_init(RainSim *s, int cols, int rows, float density, float speedMul,
 void rain_free(RainSim *s)
 {
     free(s->glyph);
+    free(s->glyphIdx);
     free(s->bright);
     free(s->streams);
     free(s->decay);
@@ -132,8 +141,8 @@ void rain_step(RainSim *s, float dt)
         dt = 0.25f;
 
     for (int c = 0; c < s->cols; c++) {
-        float      *colB = &s->bright[(size_t)c * s->rows];
-        wchar_t    *colG = &s->glyph[(size_t)c * s->rows];
+        size_t      base = (size_t)c * s->rows;
+        float      *colB = &s->bright[base];
         RainStream *st   = &s->streams[c];
         float       shed = s->decay[c] * dt;
 
@@ -158,7 +167,8 @@ void rain_step(RainSim *s, float dt)
             cur = ifloor(st->headRow);
             for (int r = prev + 1; r <= cur; r++) {
                 if (r >= 0 && r < s->rows) {
-                    colG[r] = random_glyph(&s->rng);
+                    set_cell_glyph(s, base + (size_t)r,
+                                   random_glyph_index(&s->rng));
                     colB[r] = 1.0f;
                 }
             }
@@ -175,7 +185,7 @@ void rain_step(RainSim *s, float dt)
         int   n = s->cols * s->rows;
         for (int i = 0; i < n; i++) {
             if (s->bright[i] > 0.0f && frand(&s->rng) < p)
-                s->glyph[i] = random_glyph(&s->rng);
+                set_cell_glyph(s, (size_t)i, random_glyph_index(&s->rng));
         }
     }
 
@@ -219,5 +229,72 @@ int rain_lit_cells(const RainSim *s)
     int total = s->cols * s->rows;
     for (int i = 0; i < total; i++)
         n += (s->bright[i] > 0.0f) ? 1 : 0;
+    return n;
+}
+
+/* ---- dirty-cell rendering support (see rain.h for the level/code model) -- */
+
+const wchar_t *rain_glyph_table(int *count)
+{
+    ensure_glyphs();
+    if (count)
+        *count = g_glyphCount;
+    return g_glyphs;
+}
+
+int rain_glyph_count(void)
+{
+    ensure_glyphs();
+    return g_glyphCount;
+}
+
+int rain_cell_code(const RainSim *s, int col, int row, int headRow, int shades)
+{
+    size_t cell = (size_t)col * s->rows + (size_t)row;
+    int    level;
+
+    if (row == headRow) {
+        level = shades + 1;                  /* head color, drawn regardless */
+    } else {
+        float b = s->bright[cell];
+        int   shade;
+
+        if (b <= 0.0f)
+            return 0;
+        shade = (int)(b * (float)(shades - 1) + 0.5f);
+        if (shade >= shades)
+            shade = shades - 1;
+        if (shade <= 0)                      /* black-on-black == empty */
+            return 0;
+        level = shade + 1;
+    }
+    return level * g_glyphCount + (int)s->glyphIdx[cell];
+}
+
+int rain_diff(const RainSim *s, int shades, int *lastCodes, int *dirtyIdx)
+{
+    int n = 0;
+
+    for (int c = 0; c < s->cols; c++) {
+        int          head = rain_head_cell(s, c);
+        size_t       base = (size_t)c * s->rows;
+        const float *colB = &s->bright[base];
+
+        for (int r = 0; r < s->rows; r++) {
+            size_t i = base + (size_t)r;
+            int    code;
+
+            /* Fast path: dark cell that is not the head is always code 0. */
+            if (colB[r] <= 0.0f && r != head)
+                code = 0;
+            else
+                code = rain_cell_code(s, c, r, head, shades);
+
+            if (code != lastCodes[i]) {
+                lastCodes[i] = code;
+                dirtyIdx[n++] = (int)i;
+            }
+        }
+    }
     return n;
 }

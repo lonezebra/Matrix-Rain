@@ -4,7 +4,9 @@
 #include <windows.h>
 #include <commctrl.h>
 
+#include <limits.h>
 #include <stdio.h>
+#include <stdlib.h>
 #include <wchar.h>
 #include <wctype.h>
 
@@ -108,14 +110,27 @@ static void save_settings(const Settings *s)
 
 /* --------------------------------------------------------------- rendering */
 
+/* Rendering model: all glyphs are pre-rasterized once into a glyph *atlas*
+ * (one tile per glyph per draw level, black background baked in). Per frame
+ * only cells whose quantized (level, glyph) code changed are updated on the
+ * persistent back buffer, each with a single BitBlt from the atlas — the GDI
+ * font engine does zero work per frame. Atlas layout: glyphCount columns by
+ * RAMP_STEPS + 2 rows (row 0 = all-black "empty" tiles, rows 1..RAMP_STEPS =
+ * trail shades dark->bright, top row = head color), each tile cellW x cellH.
+ */
 typedef struct RainWindow {
     RainSim       sim;
     BOOL          preview;
     int           width, height;
     int           cellW, cellH;
-    HDC           memDC;
+    HDC           memDC;            /* persistent back buffer */
     HBITMAP       bmp, oldBmp;
-    HFONT         font, oldFont;
+    HDC           atlasDC;          /* pre-rendered glyph tiles */
+    HBITMAP       atlasBmp, atlasOldBmp;
+    int           atlasW, atlasH;
+    int           glyphCount;
+    int          *lastCodes;        /* per-cell last-drawn (level,glyph) code */
+    int          *dirtyIdx;         /* scratch: dirty cell indices per frame */
     COLORREF      ramp[RAMP_STEPS]; /* rain color -> black */
     COLORREF      headColor;
     LARGE_INTEGER lastTick;
@@ -172,22 +187,70 @@ static void build_palette(RainWindow *rw, COLORREF rain)
 static void destroy_surface(RainWindow *rw)
 {
     if (rw->memDC) {
-        if (rw->oldFont)
-            SelectObject(rw->memDC, rw->oldFont);
         if (rw->oldBmp)
             SelectObject(rw->memDC, rw->oldBmp);
         DeleteDC(rw->memDC);
-        rw->memDC = NULL;
+        rw->memDC  = NULL;
+        rw->oldBmp = NULL;
     }
     if (rw->bmp) {
         DeleteObject(rw->bmp);
         rw->bmp = NULL;
     }
-    if (rw->font) {
-        DeleteObject(rw->font); /* no-op if it is the stock font */
-        rw->font = NULL;
+    if (rw->atlasDC) {
+        if (rw->atlasOldBmp)
+            SelectObject(rw->atlasDC, rw->atlasOldBmp);
+        DeleteDC(rw->atlasDC);
+        rw->atlasDC     = NULL;
+        rw->atlasOldBmp = NULL;
+    }
+    if (rw->atlasBmp) {
+        DeleteObject(rw->atlasBmp);
+        rw->atlasBmp = NULL;
+    }
+    if (rw->lastCodes) {
+        HeapFree(GetProcessHeap(), 0, rw->lastCodes);
+        rw->lastCodes = NULL;
+    }
+    if (rw->dirtyIdx) {
+        HeapFree(GetProcessHeap(), 0, rw->dirtyIdx);
+        rw->dirtyIdx = NULL;
     }
     rain_free(&rw->sim);
+}
+
+/* Draw every glyph at every draw level into the atlas, once. The font is
+ * created, used, and released right here — no GDI font work ever happens
+ * per frame afterwards. Tiles are clipped to their cell so an overwide
+ * glyph can never bleed into a neighboring tile. */
+static void render_atlas(RainWindow *rw, int size)
+{
+    RECT           rc      = { 0, 0, rw->atlasW, rw->atlasH };
+    HFONT          font    = create_glyph_font(size);
+    HFONT          oldFont = (HFONT)SelectObject(rw->atlasDC, font);
+    int            count;
+    const wchar_t *glyphs  = rain_glyph_table(&count);
+
+    FillRect(rw->atlasDC, &rc, (HBRUSH)GetStockObject(BLACK_BRUSH));
+    SetBkMode(rw->atlasDC, TRANSPARENT);
+
+    /* Row 0 stays all black (the "empty" tiles). Row 1 would be ramp[0],
+     * pure black text on black — rain_cell_code folds that level into
+     * "empty", so leave it black too and skip the pointless text calls. */
+    for (int level = 2; level <= RAMP_STEPS + 1; level++) {
+        SetTextColor(rw->atlasDC, level == RAMP_STEPS + 1
+                                      ? rw->headColor
+                                      : rw->ramp[level - 1]);
+        for (int g = 0; g < count; g++) {
+            RECT tile = { g * rw->cellW, level * rw->cellH,
+                          (g + 1) * rw->cellW, (level + 1) * rw->cellH };
+            ExtTextOutW(rw->atlasDC, tile.left, tile.top, ETO_CLIPPED, &tile,
+                        &glyphs[g], 1, NULL);
+        }
+    }
+
+    SelectObject(rw->atlasDC, oldFont);
+    DeleteObject(font); /* no-op if it is the stock font */
 }
 
 static BOOL build_surface(RainWindow *rw, HWND hwnd, int width, int height)
@@ -226,56 +289,76 @@ static BOOL build_surface(RainWindow *rw, HWND hwnd, int width, int height)
                   GetTickCount() ^ (unsigned)(UINT_PTR)hwnd) != 0)
         return FALSE;
 
+    rw->glyphCount = rain_glyph_count();
+    rw->atlasW     = rw->glyphCount * rw->cellW;
+    rw->atlasH     = (RAMP_STEPS + 2) * rw->cellH;
+
     screen = GetDC(hwnd);
-    rw->memDC = CreateCompatibleDC(screen);
-    rw->bmp   = CreateCompatibleBitmap(screen, width, height); /* NOT memDC:
+    rw->memDC    = CreateCompatibleDC(screen);
+    rw->bmp      = CreateCompatibleBitmap(screen, width, height); /* NOT memDC:
                                 that would yield a 1-bpp monochrome bitmap */
+    rw->atlasDC  = CreateCompatibleDC(screen);
+    rw->atlasBmp = CreateCompatibleBitmap(screen, rw->atlasW, rw->atlasH);
     ReleaseDC(hwnd, screen);
-    if (!rw->memDC || !rw->bmp) {
+    rw->lastCodes = (int *)HeapAlloc(GetProcessHeap(), HEAP_ZERO_MEMORY,
+                                     (size_t)cols * rows * sizeof(int));
+    rw->dirtyIdx  = (int *)HeapAlloc(GetProcessHeap(), 0,
+                                     (size_t)cols * rows * sizeof(int));
+    if (!rw->memDC || !rw->bmp || !rw->atlasDC || !rw->atlasBmp
+            || !rw->lastCodes || !rw->dirtyIdx) {
         destroy_surface(rw);
         return FALSE;
     }
-    rw->oldBmp  = (HBITMAP)SelectObject(rw->memDC, rw->bmp);
-    rw->font    = create_glyph_font(size);
-    rw->oldFont = (HFONT)SelectObject(rw->memDC, rw->font);
-    SetBkMode(rw->memDC, TRANSPARENT);
+    rw->oldBmp      = (HBITMAP)SelectObject(rw->memDC, rw->bmp);
+    rw->atlasOldBmp = (HBITMAP)SelectObject(rw->atlasDC, rw->atlasBmp);
 
     build_palette(rw, g_settings.color);
+    render_atlas(rw, size);
+
+    /* Clear the persistent back buffer to black once; with lastCodes all 0
+     * ("drawn empty") every subsequent frame only touches changed cells. */
+    {
+        RECT rc = { 0, 0, width, height };
+        FillRect(rw->memDC, &rc, (HBRUSH)GetStockObject(BLACK_BRUSH));
+    }
+
     QueryPerformanceCounter(&rw->lastTick);
     return TRUE;
 }
 
-static void render_frame(RainWindow *rw)
+/* Update only cells whose quantized (level, glyph) code changed since they
+ * were last drawn: one atlas BitBlt each (the tile carries its own black
+ * background, so no clearing pass exists at all). Returns TRUE and the
+ * dirty cells' bounding rect in *dirty if anything changed. */
+static BOOL render_frame(RainWindow *rw, RECT *dirty)
 {
-    RECT     rc = { 0, 0, rw->width, rw->height };
-    RainSim *s  = &rw->sim;
+    int rows = rw->sim.rows;
+    int n    = rain_diff(&rw->sim, RAMP_STEPS, rw->lastCodes, rw->dirtyIdx);
+    int minC = INT_MAX, minR = INT_MAX, maxC = -1, maxR = -1;
 
-    FillRect(rw->memDC, &rc, (HBRUSH)GetStockObject(BLACK_BRUSH));
+    for (int k = 0; k < n; k++) {
+        int i     = rw->dirtyIdx[k];
+        int c     = i / rows;
+        int r     = i % rows;
+        int code  = rw->lastCodes[i]; /* rain_diff already stored the new code */
+        int level = code / rw->glyphCount;
+        int g     = code % rw->glyphCount;
 
-    for (int c = 0; c < s->cols; c++) {
-        const float   *colB = &s->bright[(size_t)c * s->rows];
-        const wchar_t *colG = &s->glyph[(size_t)c * s->rows];
-        int            head = rain_head_cell(s, c);
-        int            x    = c * rw->cellW;
-
-        for (int r = 0; r < s->rows; r++) {
-            float b = colB[r];
-            int   shade;
-
-            if (b <= 0.0f || r == head)
-                continue;
-            shade = (int)(b * (RAMP_STEPS - 1) + 0.5f);
-            if (shade >= RAMP_STEPS)
-                shade = RAMP_STEPS - 1;
-            SetTextColor(rw->memDC, rw->ramp[shade]);
-            ExtTextOutW(rw->memDC, x, r * rw->cellH, 0, NULL, &colG[r], 1, NULL);
-        }
-        if (head >= 0) {
-            SetTextColor(rw->memDC, rw->headColor);
-            ExtTextOutW(rw->memDC, x, head * rw->cellH, 0, NULL,
-                        &colG[head], 1, NULL);
-        }
+        BitBlt(rw->memDC, c * rw->cellW, r * rw->cellH, rw->cellW, rw->cellH,
+               rw->atlasDC, g * rw->cellW, level * rw->cellH, SRCCOPY);
+        if (c < minC) minC = c;
+        if (c > maxC) maxC = c;
+        if (r < minR) minR = r;
+        if (r > maxR) maxR = r;
     }
+
+    if (n == 0)
+        return FALSE;
+    dirty->left   = minC * rw->cellW;
+    dirty->top    = minR * rw->cellH;
+    dirty->right  = (maxC + 1) * rw->cellW;
+    dirty->bottom = (maxR + 1) * rw->cellH;
+    return TRUE;
 }
 
 /* ------------------------------------------------------------ saver window */
@@ -301,17 +384,21 @@ static LRESULT CALLBACK SaverWndProc(HWND hwnd, UINT msg, WPARAM wParam,
     }
 
     case WM_TIMER:
+        /* WM_TIMER messages coalesce (at most one pending per timer), so a
+         * slow frame can never queue a backlog; the dt-based sim just takes
+         * one larger step (clamped in rain_step) on the next tick. */
         if (rw && rw->memDC && wParam == TIMER_ID) {
             LARGE_INTEGER now;
             float         dt;
+            RECT          dirty;
 
             QueryPerformanceCounter(&now);
             dt = (float)(now.QuadPart - rw->lastTick.QuadPart)
                  / (float)g_qpf.QuadPart;
             rw->lastTick = now;
             rain_step(&rw->sim, dt);
-            render_frame(rw);
-            InvalidateRect(hwnd, NULL, FALSE);
+            if (render_frame(rw, &dirty))
+                InvalidateRect(hwnd, &dirty, FALSE);
         }
         return 0;
 
@@ -319,8 +406,14 @@ static LRESULT CALLBACK SaverWndProc(HWND hwnd, UINT msg, WPARAM wParam,
         PAINTSTRUCT ps;
         HDC         hdc = BeginPaint(hwnd, &ps);
 
+        /* One blit of the update region from the persistent back buffer —
+         * the dirty-cell bounding rect after a timer tick, or whatever the
+         * system exposed. Never re-renders cells. */
         if (rw && rw->memDC)
-            BitBlt(hdc, 0, 0, rw->width, rw->height, rw->memDC, 0, 0, SRCCOPY);
+            BitBlt(hdc, ps.rcPaint.left, ps.rcPaint.top,
+                   ps.rcPaint.right - ps.rcPaint.left,
+                   ps.rcPaint.bottom - ps.rcPaint.top,
+                   rw->memDC, ps.rcPaint.left, ps.rcPaint.top, SRCCOPY);
         else
             FillRect(hdc, &ps.rcPaint, (HBRUSH)GetStockObject(BLACK_BRUSH));
         EndPaint(hwnd, &ps);
@@ -748,6 +841,10 @@ static int run_test(void)
     RainSim s;
     int     cols = 160, rows = 50;
     float   dt   = 1.0f / 30.0f;
+    int    *last, *dirty;
+    long    ssDirty = 0, ssLit = 0, ssFrames = 0;
+    int     doubleDirty = 0, firstDirty = 0, firstLit = 0;
+    int     fail = 0;
 
     AllocConsole();
     {
@@ -766,26 +863,90 @@ static int run_test(void)
         printf("rain_init failed\n");
         return 1;
     }
+    /* Dirty-cell bookkeeping, exactly as the renderer drives it: lastCodes
+     * all 0 = "everything drawn as empty" (back buffer cleared to black). */
+    last  = (int *)calloc((size_t)cols * rows, sizeof(int));
+    dirty = (int *)malloc((size_t)cols * rows * sizeof(int));
+    if (!last || !dirty) {
+        printf("alloc failed\n");
+        return 1;
+    }
 
     for (int frame = 1; frame <= 300; frame++) {
+        int lit, nd;
+
         rain_step(&s, dt);
+        lit = rain_lit_cells(&s);
+        nd  = rain_diff(&s, RAMP_STEPS, last, dirty);
+
+        /* Idempotence: with no sim step in between, nothing may be dirty —
+         * a cell must never be reported twice with identical (shade,glyph). */
+        doubleDirty += rain_diff(&s, RAMP_STEPS, last, dirty);
+
+        /* Streams spawn above the top edge and stagger in, so the grid is
+         * empty for the first few frames; anchor the "first frame draws all
+         * lit cells" check on the first frame with anything lit. */
+        if (firstLit == 0 && lit > 0) {
+            firstDirty = nd;
+            firstLit   = lit;
+        }
+        if (frame > 100) { /* steady state */
+            ssDirty += nd;
+            ssLit   += lit;
+            ssFrames++;
+        }
         if (frame % 30 == 0) {
-            printf("frame %3d: active=%3d/%d lit=%5d/%d spawned=%lu\n",
+            printf("frame %3d: active=%3d/%d lit=%5d/%d dirty=%4d spawned=%lu\n",
                    frame, rain_active_streams(&s),
-                   (int)(s.density * (float)cols),
-                   rain_lit_cells(&s), cols * rows, s.spawned);
+                   (int)(s.density * (float)cols), lit, cols * rows, nd,
+                   s.spawned);
         }
     }
 
     {
         int active = rain_active_streams(&s);
         int target = (int)(s.density * (float)cols);
-        printf("done: active=%d (target %d), lit=%d, spawned=%lu — %s\n",
-               active, target, rain_lit_cells(&s), s.spawned,
-               (active > 0 && active <= target) ? "OK" : "SUSPECT");
+
+        if (!(active > 0 && active <= target))
+            fail++;
+        printf("done: active=%d (target %d), lit=%d, spawned=%lu\n",
+               active, target, rain_lit_cells(&s), s.spawned);
+
+        /* First lit frame: every lit cell is freshly drawn, so dirty must be
+         * close to lit (shade-0 cells fold to empty, so <= lit). */
+        printf("first lit frame: %d dirty vs %d lit — %s\n",
+               firstDirty, firstLit,
+               (firstDirty > 0 && firstDirty <= firstLit
+                && firstDirty * 2 >= firstLit) ? "OK" : "FAIL");
+        if (!(firstDirty > 0 && firstDirty <= firstLit
+              && firstDirty * 2 >= firstLit))
+            fail++;
+
+        /* Steady state: only cells crossing a quantization boundary redraw,
+         * so dirty per frame must be well below the lit-cell count. */
+        if (ssFrames > 0) {
+            long avgDirty = ssDirty / ssFrames;
+            long avgLit   = ssLit / ssFrames;
+            printf("steady state (frames 101-300): avg dirty/frame=%ld, "
+                   "avg lit=%ld (%.1f%%) — %s\n",
+                   avgDirty, avgLit,
+                   100.0 * (double)avgDirty / (double)(avgLit ? avgLit : 1),
+                   (avgDirty > 0 && avgDirty * 2 < avgLit) ? "OK" : "FAIL");
+            if (!(avgDirty > 0 && avgDirty * 2 < avgLit))
+                fail++;
+        }
+
+        printf("re-diff with unchanged state: %d cells re-reported — %s\n",
+               doubleDirty, doubleDirty == 0 ? "OK" : "FAIL");
+        if (doubleDirty != 0)
+            fail++;
+
+        printf("%s\n", fail == 0 ? "ALL OK" : "SUSPECT");
     }
+    free(last);
+    free(dirty);
     rain_free(&s);
-    return 0;
+    return fail == 0 ? 0 : 1;
 }
 
 /* ------------------------------------------------------------ command line */
