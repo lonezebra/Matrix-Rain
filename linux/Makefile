@@ -1,5 +1,5 @@
 PREFIX ?= /usr/local
-PKGS    = x11 xft xext fontconfig
+PKGS    = x11 xft fontconfig
 
 CC     ?= cc
 CFLAGS ?= -O2

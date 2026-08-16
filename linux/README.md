@@ -1,32 +1,34 @@
 # Matrix Rain — Linux (X11)
 
 Movie-accurate Matrix digital rain screensaver in C11 using Xlib + Xft
-(fontconfig), double-buffered (Xdbe with automatic Pixmap fallback).
+(fontconfig), flicker-free via a persistent Pixmap back buffer with
+dirty-cell rendering (only cells whose appearance changed are redrawn
+each frame, in batched draw calls).
 Implements the shared simulation model in [`../SPEC.md`](../SPEC.md).
 
 ## Dependencies
 
 Build needs a C compiler, `make`, `pkg-config`, and dev headers for
-X11, Xft, Xext, and fontconfig. A CJK monospace font (Noto Sans Mono
+X11, Xft, and fontconfig. A CJK monospace font (Noto Sans Mono
 CJK JP) gives the authentic half-width katakana glyphs; without one the
 program falls back to digits + latin.
 
 **Debian / Ubuntu**
 
 ```sh
-sudo apt install build-essential pkg-config libx11-dev libxft-dev libxext-dev libfontconfig-dev fonts-noto-cjk
+sudo apt install build-essential pkg-config libx11-dev libxft-dev libfontconfig-dev fonts-noto-cjk
 ```
 
 **Fedora**
 
 ```sh
-sudo dnf install gcc make pkgconf-pkg-config libX11-devel libXft-devel libXext-devel fontconfig-devel google-noto-sans-mono-cjk-jp-fonts
+sudo dnf install gcc make pkgconf-pkg-config libX11-devel libXft-devel fontconfig-devel google-noto-sans-mono-cjk-jp-fonts
 ```
 
 **Arch**
 
 ```sh
-sudo pacman -S base-devel libx11 libxft libxext fontconfig noto-fonts-cjk
+sudo pacman -S base-devel libx11 libxft fontconfig noto-fonts-cjk
 ```
 
 ## Build & install
@@ -103,3 +105,13 @@ is out of scope here.
 `matrix-rain -selftest` runs the display-independent simulation core
 (`rain.c`) headless for 300 frames and prints stream/cell statistics —
 useful for CI or machines without an X display.
+
+`matrix-rain -window -bench <seconds>` runs the real X render path at
+full display resolution with the FPS cap removed (simulation still
+advances in real time), then prints total frames, average/max frame
+render time, and average glyph-draw-calls per frame. Handy under Xvfb
+for regression-checking render performance, e.g.:
+
+```sh
+xvfb-run -s "-screen 0 1920x1080x24" ./matrix-rain -window -bench 20
+```
