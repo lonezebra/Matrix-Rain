@@ -656,6 +656,7 @@ int main(int argc, char **argv)
     Window target_win = None;
     int want_selftest = 0;
     int bench_seconds = 0;      /* hidden: -bench <seconds> */
+    int want_fpslog = 0;        /* hidden: -fpslog (real capped loop) */
 
     load_config(&st);
 
@@ -687,6 +688,8 @@ int main(int argc, char **argv)
             if (++i >= argc) goto missing_arg;
             bench_seconds = atoi(argv[i]);
             if (bench_seconds < 1) bench_seconds = 1;
+        } else if (!strcmp(a, "-fpslog")) {
+            want_fpslog = 1;
         } else if (!strcmp(a, "-color") || !strcmp(a, "-density") ||
                    !strcmp(a, "-size") || !strcmp(a, "-speed") ||
                    !strcmp(a, "-fps") || !strcmp(a, "-font")) {
@@ -872,6 +875,13 @@ int main(int argc, char **argv)
     double next = last;
     int running = 1;
 
+    /* -fpslog: report achieved fps every ~2s in the real, fps-capped loop
+     * (as opposed to -bench's uncapped throughput number), so an external
+     * monitor can correlate CPU/GPU% samples with actual frame delivery. */
+    const double fpslog_interval = 2.0;
+    double fpslog_window_start = last;
+    long fpslog_window_frames = 0;
+
     while (running && !quit_flag) {
         while (XPending(g.dpy)) {
             XEvent ev;
@@ -935,6 +945,19 @@ int main(int argc, char **argv)
             next += frame;
             if (next < t)
                 next = t + frame;
+
+            if (want_fpslog) {
+                fpslog_window_frames++;
+                double since = t - fpslog_window_start;
+                if (since >= fpslog_interval) {
+                    printf("fpslog t=%.1f fps=%.2f frames=%ld\n",
+                           t, (double)fpslog_window_frames / since,
+                           fpslog_window_frames);
+                    fflush(stdout);
+                    fpslog_window_start = t;
+                    fpslog_window_frames = 0;
+                }
+            }
         }
 
         double wait = next - now_sec();

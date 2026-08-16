@@ -1,9 +1,10 @@
 #!/usr/bin/env bash
 # Regression test for the "chugs after a few seconds" bug: runs the real
-# (fps-capped, windowed) renderer for a while and samples process CPU%
-# over time. FAILS if late-run CPU% is significantly higher than
-# early-run CPU% -- that growth pattern is exactly the symptom the
-# dirty-cell rendering fix (see ../matrix_rain.c) was written to kill.
+# (fps-capped, windowed) renderer for a while and samples process CPU%,
+# achieved framerate (via -fpslog), and GPU% over time. FAILS if late-run
+# CPU% is significantly higher than early-run CPU% -- that growth pattern
+# is exactly the symptom the dirty-cell rendering fix (see
+# ../matrix_rain.c) was written to kill.
 #
 # GPU utilization is sampled best-effort (nvidia-smi / intel_gpu_top /
 # radeontop, whichever is present) for informational purposes only: the
@@ -63,9 +64,11 @@ read_proc_ticks() {
     awk '{print $14+$15}' "/proc/$1/stat" 2>/dev/null
 }
 
+FPS_LOG=$(mktemp)
 cleanup() {
     [ -n "${RAIN_PID:-}" ] && kill "$RAIN_PID" 2>/dev/null
     [ -n "${XVFB_PID:-}" ] && kill "$XVFB_PID" 2>/dev/null
+    rm -f "$FPS_LOG"
 }
 trap cleanup EXIT INT TERM
 
@@ -87,7 +90,7 @@ else
 fi
 
 echo "launching matrix-rain -window ${WIDTH}x${HEIGHT} for ${DURATION}s on display $DISPLAY"
-"$BIN" -window -density 0.9 -speed 1.5 &
+"$BIN" -window -fpslog -density 0.9 -speed 1.5 >"$FPS_LOG" 2>&1 &
 RAIN_PID=$!
 sleep 1
 if ! kill -0 "$RAIN_PID" 2>/dev/null; then
@@ -96,11 +99,12 @@ if ! kill -0 "$RAIN_PID" 2>/dev/null; then
 fi
 
 SAMPLES=$((DURATION / SAMPLE_INTERVAL))
-declare -a CPU_PCT GPU_PCT TIMESTAMPS
+declare -a CPU_PCT GPU_PCT FPS_VAL TIMESTAMPS
 prev_ticks=$(read_proc_ticks "$RAIN_PID")
 prev_time=$(date +%s.%N)
+fps_line=0   # number of "fpslog" lines already consumed from $FPS_LOG
 
-printf "%6s  %8s  %8s\n" "t(s)" "cpu%" "gpu%"
+printf "%6s  %8s  %8s  %8s\n" "t(s)" "cpu%" "gpu%" "fps"
 for ((i = 1; i <= SAMPLES; i++)); do
     sleep "$SAMPLE_INTERVAL"
     if ! kill -0 "$RAIN_PID" 2>/dev/null; then
@@ -114,10 +118,25 @@ for ((i = 1; i <= SAMPLES; i++)); do
     cpu_pct=$(echo "scale=2; 100 * $dt_ticks / $CLK_TCK / $dt_time" | bc | sed 's/^\./0./')
     gpu_pct=$(sample_gpu_pct "$GPU_TOOL")
     [ -z "$gpu_pct" ] && gpu_pct="n/a"
+
+    # -fpslog emits one line roughly every 2s; take the most recent new
+    # line's fps value as this sample's reading (average if more than one
+    # landed in this window).
+    total_lines=$(wc -l < "$FPS_LOG" 2>/dev/null || echo 0)
+    fps=""
+    if [ "$total_lines" -gt "$fps_line" ]; then
+        fps=$(sed -n "$((fps_line + 1)),${total_lines}p" "$FPS_LOG" |
+              grep -oE 'fps=[0-9.]+' | cut -d= -f2 |
+              awk '{s+=$1; n++} END {if (n>0) printf "%.2f", s/n}')
+        fps_line=$total_lines
+    fi
+    [ -z "$fps" ] && fps="n/a"
+
     CPU_PCT[i]=$cpu_pct
     GPU_PCT[i]=$gpu_pct
+    FPS_VAL[i]=$fps
     TIMESTAMPS[i]=$((i * SAMPLE_INTERVAL))
-    printf "%6s  %8s  %8s\n" "${TIMESTAMPS[i]}" "$cpu_pct" "$gpu_pct"
+    printf "%6s  %8s  %8s  %8s\n" "${TIMESTAMPS[i]}" "$cpu_pct" "$gpu_pct" "$fps"
     prev_ticks=$now_ticks
     prev_time=$now_time
 done
@@ -136,15 +155,28 @@ fi
 
 early_sum=0
 for ((i = 1; i <= THIRD; i++)); do early_sum=$(echo "$early_sum + ${CPU_PCT[i]}" | bc); done
-early_avg=$(echo "scale=2; $early_sum / $THIRD" | bc)
+early_avg=$(echo "scale=2; $early_sum / $THIRD" | bc | sed 's/^\./0./')
 
 late_sum=0
 for ((i = SAMPLES - THIRD + 1; i <= SAMPLES; i++)); do late_sum=$(echo "$late_sum + ${CPU_PCT[i]}" | bc); done
-late_avg=$(echo "scale=2; $late_sum / $THIRD" | bc)
+late_avg=$(echo "scale=2; $late_sum / $THIRD" | bc | sed 's/^\./0./')
+
+fps_sum=0
+fps_n=0
+for ((i = 1; i <= SAMPLES; i++)); do
+    [ "${FPS_VAL[i]}" != "n/a" ] && { fps_sum=$(echo "$fps_sum + ${FPS_VAL[i]}" | bc); fps_n=$((fps_n + 1)); }
+done
+if [ "$fps_n" -gt 0 ]; then
+    fps_avg=$(echo "scale=2; $fps_sum / $fps_n" | bc)
+    fps_min=$(printf '%s\n' "${FPS_VAL[@]}" | grep -v '^n/a$' | sort -n | head -1)
+else
+    fps_avg="n/a"; fps_min="n/a"
+fi
 
 echo
 echo "early-window avg CPU%: $early_avg  (first ${THIRD} samples, screen still filling)"
 echo "late-window  avg CPU%: $late_avg  (last ${THIRD} samples, screen steady-state)"
+echo "avg fps: $fps_avg   min fps: $fps_min   (target: 30, override with -fps)"
 
 growth=$(echo "scale=2; 100 * ($late_avg - $early_avg) / $early_avg" | bc 2>/dev/null)
 [ -z "$growth" ] && growth=0
