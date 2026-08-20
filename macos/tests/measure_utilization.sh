@@ -25,17 +25,23 @@ HEIGHT="${3:-1080}"
 SAMPLE_INTERVAL=2
 REGRESSION_THRESHOLD_PCT=25
 
-# Prefer a freshly built bundle (macos/MatrixRain.saver, from `make`) over
-# the installed one, so this doesn't require `make install` first.
-SAVER="$SCRIPT_DIR/../MatrixRain.saver"
-if [ ! -d "$SAVER" ]; then
-    SAVER="$HOME/Library/Screen Savers/MatrixRain.saver"
-fi
-if [ ! -d "$SAVER" ]; then
-    echo "error: MatrixRain.saver not found -- run 'make' in macos/ first" >&2
+# Always (re)build via `make` before measuring: `make`'s own dependency
+# tracking rebuilds the bundle iff Sources/*.swift changed since the last
+# build, and is a fast no-op otherwise. This exists because an earlier
+# version of this script used whatever bundle happened to already be on
+# disk -- which silently benchmarked a stale build (from before a perf fix
+# landed) and produced a false "still chugging" regression report.
+echo "note: building MatrixRain.saver (make is a no-op if already current)"
+if ! make -C "$SCRIPT_DIR/.." >/dev/null; then
+    echo "error: 'make' failed in macos/ -- see output above" >&2
     exit 2
 fi
-echo "note: using bundle at $SAVER"
+SAVER="$SCRIPT_DIR/../MatrixRain.saver"
+if [ ! -d "$SAVER" ]; then
+    echo "error: MatrixRain.saver not found after 'make' -- unexpected" >&2
+    exit 2
+fi
+echo "note: using freshly built bundle at $SAVER"
 
 HOST_SRC="$SCRIPT_DIR/PreviewHost.swift"
 HOST_BIN="$SCRIPT_DIR/PreviewHost"
